@@ -56,6 +56,7 @@ class SeedVault:
         self.manifest_path = self.vault_dir / "vault_manifest.json"
         self.digest_path = self.vault_dir / "state_digest.json"
         self._lock = threading.Lock()
+        self.ensure_dirs()
         self._manifest: Dict[str, Any] = self._load_manifest()
 
     # -- Directory setup ----------------------------------------------------
@@ -159,6 +160,27 @@ class SeedVault:
         seed["updated"] = _utc_now()
         return self.write_seed(seed)
 
+    def adjust_trust(self, seed_id: str, delta: float, reason: str) -> bool:
+        """Adjust a seed's trust score by delta, clamped to [0.0, 1.0].
+        
+        Appends an entry to trust_history with the delta, reason, new value,
+        and timestamp. Returns False if seed not found.
+        """
+        seed = self.get_seed(seed_id)
+        if not seed:
+            return False
+        current = seed.get("trust_score", 0.0)
+        new_score = max(0.0, min(1.0, current + delta))
+        seed["trust_score"] = new_score
+        seed.setdefault("trust_history", []).append({
+            "delta": delta,
+            "reason": reason,
+            "value": new_score,
+            "at": _utc_now(),
+        })
+        seed["updated"] = _utc_now()
+        return self.write_seed(seed)
+
     def archive_seed(self, seed_id: str) -> bool:
         """Move a seed from seeds/ to archive/."""
         src = self.seeds_dir / f"{seed_id}.json"
@@ -179,12 +201,15 @@ class SeedVault:
     # -- Supersession -------------------------------------------------------
 
     def find_superseded_candidates(self, new_seed: Dict[str, Any]) -> List[str]:
-        """Find active seeds with the same primary tag that should be superseded.
+        """Find active or superseded seeds with the same primary tag.
         
         Matching rule: exact primary-tag match (first tag in tags[]).
         This is stricter than the Stage-1 dedup gate (Jaccard >0.7 on core_claim).
         Dedup prevents committing a near-duplicate; supersession handles
         "same domain, different claim."
+        
+        Includes already-superseded seeds so multiple children can supersede
+        the same parent (superseded_by is a list).
         """
         new_tags = new_seed.get("tags", [])
         if not new_tags:
@@ -192,7 +217,7 @@ class SeedVault:
         primary_tag = new_tags[0]
         candidates = []
         for seed_id, meta in self._manifest.get("seeds", {}).items():
-            if meta.get("status") != "active":
+            if meta.get("status") not in ("active", "superseded"):
                 continue
             if seed_id == new_seed.get("id"):
                 continue
