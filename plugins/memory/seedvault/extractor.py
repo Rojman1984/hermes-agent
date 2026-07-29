@@ -136,6 +136,9 @@ Rules:
 - Skip transient state (current file contents, in-progress calculations, temporary observations).
 - Skip opinions and speculation. Extract verified facts and explicit decisions only.
 - If a fact depends on or relates to another fact, add a meristem edge.
+  Meristem edges are objects with "type" and "target" fields:
+  - type: one of "prerequisite", "nextstep", "bridge", "supersedes", "related"
+  - target: the seed ID this edge points to (only use IDs from other seeds in this same output array)
 - Output a JSON array of seed objects. If no seeds are found, output [].
 
 Conversation messages:
@@ -209,6 +212,26 @@ def _llm_extract(
         if chunk_type not in ("constraint", "status", "decision", "insight", "preference", "error"):
             chunk_type = "insight"
 
+        # B5: parse meristem edges from LLM response instead of hardcoding [].
+        # Sanitize each edge — must be a dict with a non-empty "target" string
+        # and a valid "type". Malformed edges are dropped here; dangling edges
+        # (target points to a seed not yet in the vault) are dropped later by
+        # the commit gate's validate_meristems().
+        valid_meristem_types = {"prerequisite", "nextstep", "bridge", "supersedes", "related"}
+        raw_meristems = item.get("meristems", [])
+        meristems: List[Dict[str, Any]] = []
+        if isinstance(raw_meristems, list):
+            for edge in raw_meristems:
+                if not isinstance(edge, dict):
+                    continue
+                target = edge.get("target", "")
+                edge_type = edge.get("type", "related")
+                if not isinstance(target, str) or not target.strip():
+                    continue
+                if edge_type not in valid_meristem_types:
+                    edge_type = "related"
+                meristems.append({"type": edge_type, "target": target.strip()})
+
         seed = {
             "id": _make_seed_id(domain, chunk_type, i),
             "core_claim": claim[:500],
@@ -216,7 +239,7 @@ def _llm_extract(
                 "type": chunk_type,
                 "content": claim[:1000],
             }],
-            "meristems": [],
+            "meristems": meristems,
             "source_ref": {
                 "session_id": session_id,
                 "profile": profile,

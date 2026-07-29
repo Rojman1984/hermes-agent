@@ -15,6 +15,7 @@ from plugins.memory.seedvault.extractor import (
     _make_seed_id,
     _utc_now,
     _heuristic_extract as heuristic_extract,
+    _llm_extract as llm_extract,
 )
 from plugins.memory.seedvault.validator import CommitGate
 from plugins.memory.seedvault.state_digest import StateDigestManager
@@ -690,3 +691,178 @@ class TestStage2AutoArchive:
             e["delta"] for e in stored["trust_history"] if e["delta"] is not None
         )
         assert pytest.approx(initial_value + total_delta) == stored["trust_score"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: B5 — LLM-extracted meristem edges
+# ---------------------------------------------------------------------------
+
+class TestLLMMeristemExtraction:
+    """B5: _llm_extract() must parse meristem edges from LLM responses.
+
+    Previously hardcoded "meristems": [] — the prompt asked for edges but the
+    parser never read them. Now we parse item.get("meristems", []) and sanitize
+    each edge. Dangling edges (target not in vault) are dropped by the commit
+    gate's validate_meristems(), not by the extractor.
+    """
+
+    @staticmethod
+    def _mock_caller(response_text):
+        """Return a callable that ignores inputs and returns response_text."""
+        def _caller(system_prompt, user_content):
+            return response_text
+        return _caller
+
+    def test_valid_meristem_preserved(self):
+        """A well-formed meristem edge in the LLM response appears in the seed."""
+        llm_response = json.dumps([
+            {
+                "core_claim": "OLLAMA_FLASH_ATTENTION must stay OFF.",
+                "chunk_type": "constraint",
+                "domain": "env",
+                "tags": ["env", "ollama"],
+            },
+            {
+                "core_claim": "Vulkan crashes occur when flash attention is enabled on AMD iGPU.",
+                "chunk_type": "error",
+                "domain": "error",
+                "tags": ["error", "vulkan"],
+                "meristems": [
+                    {"type": "prerequisite", "target": "env-constraint-001"},
+                ],
+            },
+        ])
+        seeds = llm_extract(
+            [{"role": "user", "content": "some message"}],
+            "s1", "default",
+            self._mock_caller(llm_response),
+        )
+        assert len(seeds) == 2
+        # Second seed should have the meristem edge
+        assert len(seeds[1]["meristems"]) == 1
+        assert seeds[1]["meristems"][0]["type"] == "prerequisite"
+        assert seeds[1]["meristems"][0]["target"] == "env-constraint-001"
+
+    def test_no_meristems_defaults_to_empty(self):
+        """LLM response without meristems field defaults to []."""
+        llm_response = json.dumps([
+            {
+                "core_claim": "User prefers Python for scripting.",
+                "chunk_type": "preference",
+                "domain": "pref",
+                "tags": ["pref", "python"],
+            },
+        ])
+        seeds = llm_extract(
+            [{"role": "user", "content": "some message"}],
+            "s1", "default",
+            self._mock_caller(llm_response),
+        )
+        assert len(seeds) == 1
+        assert seeds[0]["meristems"] == []
+
+    def test_dangling_edge_dropped_by_commit_gate(self, tmp_vault):
+        """Dangling meristem (target not in vault) is dropped by commit gate."""
+        # Pre-commit an existing seed so we have a valid target
+        existing = _make_seed("env-real-001",
+                              core_claim="Flash attention causes device loss on AMD graphics.",
+                              tags=["env", "ollama"])
+        tmp_vault.write_seed(existing)
+
+        llm_response = json.dumps([
+            {
+                "core_claim": "The driver stack needs the proprietary AMDGPU driver.",
+                "chunk_type": "constraint",
+                "domain": "env",
+                "tags": ["env", "driver"],
+                "meristems": [
+                    {"type": "related", "target": "env-real-001"},   # exists
+                    {"type": "related", "target": "env-nope-999"},   # dangling
+                ],
+            },
+        ])
+        seeds = llm_extract(
+            [{"role": "user", "content": "some message"}],
+            "s1", "default",
+            self._mock_caller(llm_response),
+        )
+        assert len(seeds) == 1
+        # Extractor preserves both edges — it doesn't know what's in the vault
+        assert len(seeds[0]["meristems"]) == 2
+
+        # Commit gate drops the dangling one
+        gate = CommitGate(tmp_vault)
+        ok, _ = gate.commit(seeds[0])
+        assert ok
+        stored = tmp_vault.get_seed(seeds[0]["id"])
+        non_supersedes = [m for m in stored["meristems"] if m["type"] != "supersedes"]
+        assert len(non_supersedes) == 1
+        assert non_supersedes[0]["target"] == "env-real-001"
+
+    def test_malformed_meristems_dropped(self):
+        """Non-dict edges, missing target, and non-string target are dropped."""
+        llm_response = json.dumps([
+            {
+                "core_claim": "The system uses Conduit as the Matrix homeserver.",
+                "chunk_type": "decision",
+                "domain": "decision",
+                "tags": ["decision", "matrix"],
+                "meristems": [
+                    "not-a-dict",                                # not a dict
+                    {"type": "related"},                         # missing target
+                    {"type": "related", "target": ""},           # empty target
+                    {"type": "related", "target": 123},          # non-string target
+                    {"type": "related", "target": "  env-real-001  "},  # valid (whitespace trimmed)
+                ],
+            },
+        ])
+        seeds = llm_extract(
+            [{"role": "user", "content": "some message"}],
+            "s1", "default",
+            self._mock_caller(llm_response),
+        )
+        assert len(seeds) == 1
+        # Only the last edge is valid
+        assert len(seeds[0]["meristems"]) == 1
+        assert seeds[0]["meristems"][0]["target"] == "env-real-001"
+
+    def test_invalid_meristem_type_defaults_to_related(self):
+        """An unrecognized meristem type is coerced to 'related'."""
+        llm_response = json.dumps([
+            {
+                "core_claim": "The gateway runs as a systemd user service.",
+                "chunk_type": "status",
+                "domain": "status",
+                "tags": ["status", "gateway"],
+                "meristems": [
+                    {"type": "depends_on", "target": "env-constraint-001"},
+                ],
+            },
+        ])
+        seeds = llm_extract(
+            [{"role": "user", "content": "some message"}],
+            "s1", "default",
+            self._mock_caller(llm_response),
+        )
+        assert len(seeds) == 1
+        assert len(seeds[0]["meristems"]) == 1
+        assert seeds[0]["meristems"][0]["type"] == "related"
+
+    def test_meristems_not_list_ignored(self):
+        """If meristems field is not a list (e.g. a string), it's ignored."""
+        llm_response = json.dumps([
+            {
+                "core_claim": "The vault uses file-based locking.",
+                "chunk_type": "insight",
+                "domain": "insight",
+                "tags": ["insight", "vault"],
+                "meristems": "not-a-list",
+            },
+        ])
+        seeds = llm_extract(
+            [{"role": "user", "content": "some message"}],
+            "s1", "default",
+            self._mock_caller(llm_response),
+        )
+        assert len(seeds) == 1
+        assert seeds[0]["meristems"] == []
