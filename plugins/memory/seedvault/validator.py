@@ -164,8 +164,30 @@ class CommitGate:
             seed["trust_history"].append({
                 "delta": -0.2,
                 "reason": "drift_detected",
+                "value": new_score,
                 "at": now,
             })
+            # B2: auto-archive if trust dropped below 0.3 threshold.
+            # This prevents low-trust seeds from leaking into search/prefetch
+            # (B3) — search() already excludes non-active status, so the
+            # transition here closes the gap immediately rather than waiting
+            # for the delayed prune() path (age > stale_days).
+            if new_score < 0.3:
+                seed["status"] = "archived"
+                seed["trust_history"].append({
+                    "delta": 0.0,
+                    "reason": "auto_archived",
+                    "value": new_score,
+                    "at": now,
+                })
+                seed["last_validated"] = now
+                self.vault.write_seed(seed)
+                logger.warning(
+                    "SeedVault: drift detected for seed %s (overlap=%.2f, "
+                    "trust %.2f->%.2f) — auto-archived (below 0.3)",
+                    seed["id"], overlap, old_score, new_score,
+                )
+                return False
             seed["last_validated"] = now
             self.vault.write_seed(seed)
             logger.warning("SeedVault: drift detected for seed %s (overlap=%.2f, trust %.2f->%.2f)",
@@ -180,6 +202,7 @@ class CommitGate:
         seed["trust_history"].append({
             "delta": 0.1,
             "reason": "provenance_verified",
+            "value": new_score,
             "at": now,
         })
         seed["last_validated"] = now

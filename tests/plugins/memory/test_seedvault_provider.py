@@ -55,7 +55,7 @@ def _make_seed(
         "source_ref": {"session_id": "s1", "profile": "default"},
         "trust_score": trust_score,
         "trust_history": [
-            {"delta": None, "reason": "initial", "value": 0.8, "at": _utc_now()}
+            {"delta": None, "reason": "initial", "value": trust_score, "at": _utc_now()}
         ],
         "status": status,
         "superseded_by": [],
@@ -520,3 +520,173 @@ class TestProvider:
         names = [s["name"] for s in schemas]
         assert "seedvault_search" in names
         assert "seedvault_status" in names
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: B2+B3 — auto-archive below trust 0.3 + search leakage fix
+# ---------------------------------------------------------------------------
+
+class TestStage2AutoArchive:
+    """B2: stage2_validate must auto-archive when drift pushes trust below 0.3.
+
+    B3 (search leakage) resolves automatically — search() already filters on
+    status == 'active', so once B2 transitions status to 'archived', the seed
+    disappears from search/prefetch/system_prompt_block immediately.
+    """
+
+    def test_drift_below_threshold_archives_seed(self, tmp_vault):
+        """Repeated drift pushing trust below 0.3 must set status to 'archived'."""
+        seed = _make_seed("env-drift-001", trust_score=0.4)
+        tmp_vault.write_seed(seed)
+        gate = CommitGate(tmp_vault)
+
+        # First drift: 0.4 -> 0.2 (below 0.3 threshold)
+        source_messages = [{"role": "user", "content": "completely unrelated content about cooking"}]
+        gate.stage2_validate(seed, source_messages)
+
+        stored = tmp_vault.get_seed("env-drift-001")
+        assert stored["status"] == "archived"
+        assert stored["trust_score"] == pytest.approx(0.2)
+
+    def test_search_excludes_auto_archived_seed(self, tmp_vault):
+        """B3: after auto-archive, search() must not return the drifted seed."""
+        seed = _make_seed("env-leak-001",
+                          core_claim="The quantum flux capacitor needs calibration.",
+                          tags=["env", "flux"],
+                          trust_score=0.4)
+        tmp_vault.write_seed(seed)
+
+        # Verify it shows up in search before drift
+        results = tmp_vault.search("flux", top_k=5)
+        assert len(results) == 1
+
+        # Trigger drift to auto-archive
+        gate = CommitGate(tmp_vault)
+        source_messages = [{"role": "user", "content": "completely unrelated content about cooking"}]
+        gate.stage2_validate(seed, source_messages)
+
+        # After auto-archive, search must not return it
+        results = tmp_vault.search("flux", top_k=5)
+        assert len(results) == 0
+
+    def test_threshold_boundary_stays_active_at_03(self, tmp_vault):
+        """Trust at exactly 0.3 after drift must NOT auto-archive (boundary)."""
+        seed = _make_seed("env-boundary-001", trust_score=0.5)
+        tmp_vault.write_seed(seed)
+        gate = CommitGate(tmp_vault)
+
+        # One drift: 0.5 -> 0.3 (exactly at threshold, not below)
+        source_messages = [{"role": "user", "content": "completely unrelated content about cooking"}]
+        gate.stage2_validate(seed, source_messages)
+
+        stored = tmp_vault.get_seed("env-boundary-001")
+        assert stored["trust_score"] == pytest.approx(0.3)
+        assert stored["status"] == "active"
+
+    def test_threshold_boundary_archives_below_03(self, tmp_vault):
+        """Trust at 0.29 after drift must auto-archive (just below threshold)."""
+        seed = _make_seed("env-boundary-002", trust_score=0.49)
+        tmp_vault.write_seed(seed)
+        gate = CommitGate(tmp_vault)
+
+        # 0.49 -> 0.29 (below 0.3)
+        source_messages = [{"role": "user", "content": "completely unrelated content about cooking"}]
+        gate.stage2_validate(seed, source_messages)
+
+        stored = tmp_vault.get_seed("env-boundary-002")
+        assert stored["trust_score"] == pytest.approx(0.29)
+        assert stored["status"] == "archived"
+
+    def test_drift_history_has_value_field(self, tmp_vault):
+        """Drift trust_history entries must include 'value' field (schema consistency)."""
+        seed = _make_seed("env-value-001", trust_score=0.8)
+        tmp_vault.write_seed(seed)
+        gate = CommitGate(tmp_vault)
+
+        source_messages = [{"role": "user", "content": "completely unrelated content about cooking"}]
+        gate.stage2_validate(seed, source_messages)
+
+        stored = tmp_vault.get_seed("env-value-001")
+        drift_entry = stored["trust_history"][-1]
+        assert "value" in drift_entry
+        assert drift_entry["value"] == pytest.approx(0.6)
+        assert drift_entry["delta"] == pytest.approx(-0.2)
+
+    def test_auto_archive_history_has_value_field(self, tmp_vault):
+        """Auto-archive trust_history entry must include 'value' field."""
+        seed = _make_seed("env-value-002", trust_score=0.4)
+        tmp_vault.write_seed(seed)
+        gate = CommitGate(tmp_vault)
+
+        # 0.4 -> 0.2 triggers auto-archive
+        source_messages = [{"role": "user", "content": "completely unrelated content about cooking"}]
+        gate.stage2_validate(seed, source_messages)
+
+        stored = tmp_vault.get_seed("env-value-002")
+        archive_entry = stored["trust_history"][-1]
+        assert archive_entry["reason"] == "auto_archived"
+        assert "value" in archive_entry
+        assert archive_entry["value"] == pytest.approx(0.2)
+        assert archive_entry["delta"] == pytest.approx(0.0)
+
+    def test_reconciliation_after_auto_archive(self, tmp_vault):
+        """initial_value + sum(deltas) == trust_score after auto-archive."""
+        seed = _make_seed("env-recon-001", trust_score=0.4)
+        tmp_vault.write_seed(seed)
+        gate = CommitGate(tmp_vault)
+
+        source_messages = [{"role": "user", "content": "completely unrelated content about cooking"}]
+        gate.stage2_validate(seed, source_messages)
+
+        stored = tmp_vault.get_seed("env-recon-001")
+        initial_value = stored["trust_history"][0]["value"]
+        total_delta = sum(
+            e["delta"] for e in stored["trust_history"] if e["delta"] is not None
+        )
+        assert pytest.approx(initial_value + total_delta) == stored["trust_score"]
+
+    def test_provenance_verified_includes_value_field(self, tmp_vault):
+        """Provenance-verified trust_history entry must include 'value' field."""
+        seed = _make_seed("env-verified-001", trust_score=0.5)
+        tmp_vault.write_seed(seed)
+        gate = CommitGate(tmp_vault)
+
+        # Source that matches the claim well (high overlap)
+        source_messages = [{"role": "user", "content": "Test claim about environment."}]
+        gate.stage2_validate(seed, source_messages)
+
+        stored = tmp_vault.get_seed("env-verified-001")
+        verified_entry = stored["trust_history"][-1]
+        assert verified_entry["reason"] == "provenance_verified"
+        assert "value" in verified_entry
+        assert verified_entry["value"] == pytest.approx(0.6)
+
+    def test_multiple_drifts_then_archive_reconciliation(self, tmp_vault):
+        """Two drifts: first keeps active, second archives. Reconciliation holds."""
+        seed = _make_seed("env-multi-001", trust_score=0.8)
+        tmp_vault.write_seed(seed)
+        gate = CommitGate(tmp_vault)
+
+        # Drift 1: 0.8 -> 0.6 (still active)
+        source_messages = [{"role": "user", "content": "completely unrelated content about cooking"}]
+        gate.stage2_validate(seed, source_messages)
+        stored = tmp_vault.get_seed("env-multi-001")
+        assert stored["status"] == "active"
+
+        # Drift 2: 0.6 -> 0.4 (still active)
+        gate.stage2_validate(stored, source_messages)
+        stored = tmp_vault.get_seed("env-multi-001")
+        assert stored["status"] == "active"
+
+        # Drift 3: 0.4 -> 0.2 (auto-archive)
+        gate.stage2_validate(stored, source_messages)
+        stored = tmp_vault.get_seed("env-multi-001")
+        assert stored["status"] == "archived"
+        assert stored["trust_score"] == pytest.approx(0.2)
+
+        # Reconciliation
+        initial_value = stored["trust_history"][0]["value"]
+        total_delta = sum(
+            e["delta"] for e in stored["trust_history"] if e["delta"] is not None
+        )
+        assert pytest.approx(initial_value + total_delta) == stored["trust_score"]
