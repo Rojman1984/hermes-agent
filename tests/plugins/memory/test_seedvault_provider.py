@@ -504,11 +504,11 @@ class TestCommitGate:
         assert "duplicate" in reason.lower()
 
     def test_supersession_with_near_identical_claims(self, tmp_vault):
-        """S1: even near-identical claims supersede (not dedup) when tags match.
+        """S1: genuinely different claims supersede (not dedup) when tags match.
 
-        Edge case: two seeds with the same primary tag and very similar claims
-        (high Jaccard). Without the fix, dedup rejects the second. With the fix,
-        supersession fires because the primary tag matches.
+        Two seeds with the same primary tag and similar but substantively
+        different claims. Jaccard is below the 0.95 near-duplicate ceiling,
+        so dedup is skipped and supersession fires.
         """
         gate = CommitGate(tmp_vault)
         old = _make_seed("pref-old-001", tags=["pref"],
@@ -519,10 +519,39 @@ class TestCommitGate:
         new = _make_seed("pref-new-002", tags=["pref"],
                         core_claim="User prefers dark mode in the terminal.")
         ok, reason = gate.commit(new)
-        assert ok, f"near-identical supersession candidate rejected: {reason}"
+        assert ok, f"similar-but-different supersession candidate rejected: {reason}"
 
         old_stored = tmp_vault.get_seed("pref-old-001")
         assert old_stored["status"] == "superseded"
+
+    def test_literal_duplicate_same_tag_still_rejected(self, tmp_vault):
+        """S1 regression: exact same claim under the same tag must be rejected.
+
+        The reviewer found that the initial S1 fix (skip dedup whenever
+        supersession candidates exist) let literal resubmissions through —
+        the second copy would silently supersede the first instead of being
+        rejected as a duplicate.  The near-duplicate ceiling (Jaccard >= 0.95)
+        ensures dedup still fires for near-identical claims even when the
+        primary tag matches.
+        """
+        gate = CommitGate(tmp_vault)
+        old = _make_seed("pref-old-001", tags=["pref"],
+                        core_claim="User prefers dark mode in the editor.")
+        ok, _ = gate.commit(old)
+        assert ok
+
+        # Exact same claim, same tag → must be rejected as duplicate, NOT
+        # silently superseded.
+        dup = _make_seed("pref-dup-002", tags=["pref"],
+                        core_claim="User prefers dark mode in the editor.")
+        ok, reason = gate.commit(dup)
+        assert not ok, "literal duplicate under same tag was silently accepted"
+        assert "duplicate" in reason.lower()
+
+        # Old seed must still be active with its trust score intact.
+        old_stored = tmp_vault.get_seed("pref-old-001")
+        assert old_stored["status"] == "active"
+        assert old_stored["trust_score"] == 0.8
 
 
 # ---------------------------------------------------------------------------

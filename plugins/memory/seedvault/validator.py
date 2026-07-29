@@ -86,11 +86,17 @@ class CommitGate:
         """
         # Check for supersession candidates BEFORE Stage-1 dedup so that a
         # legitimate "same domain, updated claim" seed is not rejected as a
-        # duplicate before supersession fires (S1).  When supersession
-        # candidates exist we skip the Jaccard dedup gate — the new seed is
-        # an update in the same domain, not a duplicate.
+        # duplicate before supersession fires (S1).  However, we only skip
+        # dedup when the new claim is NOT a near-identical copy of an existing
+        # candidate — a literal resubmission (Jaccard >= 0.95) is still a
+        # duplicate and must be rejected, not silently superseded.
         candidates = self.vault.find_superseded_candidates(seed)
-        skip_dedup = bool(candidates)
+        claim = seed.get("core_claim", "")
+        skip_dedup = False
+        if candidates:
+            # Skip dedup only if no candidate is a near-duplicate.
+            near_dup = self.vault.find_duplicate(claim, threshold=0.95)
+            skip_dedup = near_dup is None
 
         passed, reason = self.stage1_validate(seed, skip_dedup=skip_dedup)
         if not passed:
