@@ -152,10 +152,16 @@ class SeedVaultMemoryProvider(MemoryProvider):
     def system_prompt_block(self) -> str:
         """Return static text for the system prompt describing SeedVault.
 
-        This is STATIC info — it doesn't change between turns, preserving
-        prompt cache stability. Active seed contents are injected via
-        prefetch(), not here. The state digest is injected here only if
-        it's stable across the current session (no per-turn updates).
+        This block is genuinely STATIC — it contains only vault path and
+        extraction mode, which are fixed at init time. Live data (seed
+        counts, state digest) is deliberately excluded because it changes
+        on every seed commit / turn update, which would bust the LLM
+        prompt cache when the system prompt is rebuilt after compression.
+
+        Seed-count summaries are available via:
+        - prefetch() — injected per-turn where variation is expected
+        - seedvault_status tool call — on-demand
+        - state digest format_for_prompt() — used in prefetch, not here
         """
         if not self._vault:
             return ""
@@ -165,16 +171,6 @@ class SeedVaultMemoryProvider(MemoryProvider):
             f"Vault: {self._vault_dir}",
             f"Extraction mode: {self._extraction_mode}",
         ]
-
-        summary = self._vault.get_manifest_summary()
-        lines.append(f"Seeds: {summary.get('total', 0)} total ({summary.get('by_status', {})})")
-
-        # State digest (stable between compactions)
-        if self._digest_mgr:
-            digest_text = self._digest_mgr.format_for_prompt()
-            if digest_text:
-                lines.append("")
-                lines.append(digest_text)
 
         return "\n".join(lines)
 
@@ -189,12 +185,27 @@ class SeedVaultMemoryProvider(MemoryProvider):
         if not self._vault:
             return ""
 
+        lines = ["[SeedVault Retrieved Seeds]"]
+
+        # Include vault summary here (not in system_prompt_block) because
+        # prefetch output is per-turn and does not bust the prompt cache.
+        summary = self._vault.get_manifest_summary()
+        lines.append(
+            f"Vault: {summary.get('total', 0)} seeds "
+            f"({summary.get('by_status', {})})"
+        )
+
+        # State digest — also per-turn, not in the cached system prompt.
+        if self._digest_mgr:
+            digest_text = self._digest_mgr.format_for_prompt()
+            if digest_text:
+                lines.append(digest_text)
+
         results = self._vault.search(query, top_k=5)
         if not results:
-            self._last_prefetch_result = ""
-            return ""
+            self._last_prefetch_result = "\n".join(lines)
+            return "\n".join(lines)
 
-        lines = ["[SeedVault Retrieved Seeds]"]
         for seed in results:
             status_marker = ""  # Only active seeds are returned by search()
             lines.append(f"- [{seed['id']}] {seed['core_claim']}")

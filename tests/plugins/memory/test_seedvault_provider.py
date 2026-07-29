@@ -995,3 +995,89 @@ class TestLLMMeristemExtraction:
         )
         assert len(seeds) == 1
         assert seeds[0]["meristems"] == []
+
+
+# ---------------------------------------------------------------------------
+# Phase 7: Prompt-cache stability — system_prompt_block() must be static
+# ---------------------------------------------------------------------------
+
+class TestSystemPromptBlockStability:
+    """system_prompt_block() must not embed live data that changes on seed
+    commits. If it does, rebuilding the system prompt after compression
+    busts the LLM prompt cache.
+
+    The block should contain only vault path and extraction mode — both
+    fixed at init time. Seed counts and state digest belong in prefetch()
+    or the seedvault_status tool, where per-turn variation is expected.
+    """
+
+    def test_block_byte_identical_across_seed_commit(self, tmp_provider):
+        """Committing a seed must not change system_prompt_block() output."""
+        block_before = tmp_provider.system_prompt_block()
+
+        # Commit a seed via on_pre_compress (the normal write path)
+        tmp_provider.on_pre_compress([
+            {"role": "user", "content": "I prefer to use Python for all scripting tasks."},
+            {"role": "assistant", "content": "Got it, I'll use Python."},
+        ])
+
+        block_after = tmp_provider.system_prompt_block()
+        assert block_before == block_after
+
+    def test_block_byte_identical_across_digest_update(self, tmp_provider):
+        """sync_turn updates the state digest — block must not change."""
+        block_before = tmp_provider.system_prompt_block()
+
+        tmp_provider.sync_turn(
+            "What is the capital of France?",
+            "The capital of France is Paris.",
+            session_id="test-session-001",
+        )
+
+        block_after = tmp_provider.system_prompt_block()
+        assert block_before == block_after
+
+    def test_block_omits_seed_count(self, tmp_provider):
+        """Block must not contain live seed count or status breakdown."""
+        tmp_provider.on_pre_compress([
+            {"role": "user", "content": "I prefer dark mode in the editor."},
+            {"role": "assistant", "content": "Noted."},
+        ])
+
+        block = tmp_provider.system_prompt_block()
+        # The old code emitted "Seeds: N total (...)" — that must be gone.
+        assert "Seeds:" not in block
+        assert "total" not in block
+
+    def test_block_omits_state_digest(self, tmp_provider):
+        """Block must not contain the state digest block."""
+        # Trigger a digest update so format_for_prompt() would emit text
+        tmp_provider.sync_turn(
+            "Set up the CI pipeline for the project.",
+            "CI pipeline configured with GitHub Actions.",
+            session_id="test-session-001",
+        )
+
+        block = tmp_provider.system_prompt_block()
+        assert "State Digest" not in block
+        assert "Active seeds:" not in block
+        assert "Compactions:" not in block
+
+    def test_block_contains_static_info(self, tmp_provider):
+        """Block must still contain vault path and extraction mode."""
+        block = tmp_provider.system_prompt_block()
+        assert "SeedVault" in block
+        assert "Vault:" in block
+        assert "Extraction mode:" in block
+
+    def test_prefetch_includes_vault_summary(self, tmp_provider):
+        """prefetch() should carry the seed-count summary (moved from block)."""
+        # Add a seed so the vault is non-empty
+        tmp_provider.on_pre_compress([
+            {"role": "user", "content": "I prefer Python for scripting."},
+            {"role": "assistant", "content": "Noted."},
+        ])
+
+        result = tmp_provider.prefetch("Python scripting")
+        assert "Vault:" in result
+        assert "seeds" in result
