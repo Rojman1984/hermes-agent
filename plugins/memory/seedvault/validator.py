@@ -41,10 +41,15 @@ class CommitGate:
     def __init__(self, vault: SeedVault):
         self.vault = vault
 
-    def stage1_validate(self, seed: Dict[str, Any]) -> tuple[bool, str]:
+    def stage1_validate(self, seed: Dict[str, Any], skip_dedup: bool = False) -> tuple[bool, str]:
         """Deterministic validation. Returns (passed, reason).
-        
+
         If failed, the seed is rejected — it does NOT land in the vault.
+
+        When ``skip_dedup`` is True the Jaccard duplicate check is skipped.
+        This is used by :meth:`commit` when supersession candidates exist
+        (same primary tag), so that a legitimate "same domain, updated claim"
+        seed is not rejected as a duplicate before supersession fires (S1).
         """
         # core_claim checks
         claim = seed.get("core_claim", "")
@@ -58,10 +63,11 @@ class CommitGate:
         if not source_ref.get("session_id"):
             return False, "source_ref.session_id is null (no provenance)"
 
-        # Duplicate check
-        dup_id = self.vault.find_duplicate(claim, threshold=0.7)
-        if dup_id is not None:
-            return False, f"duplicate of existing seed {dup_id} (Jaccard >0.7)"
+        # Duplicate check — skipped when supersession applies (S1)
+        if not skip_dedup:
+            dup_id = self.vault.find_duplicate(claim, threshold=0.7)
+            if dup_id is not None:
+                return False, f"duplicate of existing seed {dup_id} (Jaccard >0.7)"
 
         # Meristem validation — drop dangling edges
         meristems = seed.get("meristems", [])
@@ -78,7 +84,15 @@ class CommitGate:
         
         Returns (committed, reason).
         """
-        passed, reason = self.stage1_validate(seed)
+        # Check for supersession candidates BEFORE Stage-1 dedup so that a
+        # legitimate "same domain, updated claim" seed is not rejected as a
+        # duplicate before supersession fires (S1).  When supersession
+        # candidates exist we skip the Jaccard dedup gate — the new seed is
+        # an update in the same domain, not a duplicate.
+        candidates = self.vault.find_superseded_candidates(seed)
+        skip_dedup = bool(candidates)
+
+        passed, reason = self.stage1_validate(seed, skip_dedup=skip_dedup)
         if not passed:
             logger.warning("SeedVault: seed rejected by Stage 1 gate: %s", reason)
             return False, reason
@@ -104,10 +118,9 @@ class CommitGate:
         if not seed.get("updated"):
             seed["updated"] = _utc_now()
 
-        # Check for supersession candidates
-        candidates = self.vault.find_superseded_candidates(seed)
+        # Supersession candidates were already identified before Stage-1.
+        # Add supersedes meristems for each.
         if candidates:
-            # Add supersedes meristems
             for old_id in candidates:
                 seed.setdefault("meristems", []).append({
                     "type": "supersedes",

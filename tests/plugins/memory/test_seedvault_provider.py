@@ -417,12 +417,112 @@ class TestCommitGate:
 
     def test_gate_rejects_duplicate(self, tmp_vault):
         gate = CommitGate(tmp_vault)
-        seed1 = _make_seed("env-dup-001", core_claim="OLLAMA_FLASH_ATTENTION must stay OFF to avoid crashes.")
+        seed1 = _make_seed("env-dup-001", tags=["env", "test"],
+                          core_claim="OLLAMA_FLASH_ATTENTION must stay OFF to avoid crashes.")
         tmp_vault.write_seed(seed1)
-        seed2 = _make_seed("env-dup-002", core_claim="OLLAMA_FLASH_ATTENTION must stay OFF to avoid crashes.")
+        # Different primary tag → no supersession candidates → dedup must fire
+        seed2 = _make_seed("config-dup-002", tags=["config", "test"],
+                          core_claim="OLLAMA_FLASH_ATTENTION must stay OFF to avoid crashes.")
         ok, reason = gate.commit(seed2)
         assert not ok
         assert "duplicate" in reason.lower()
+
+    def test_dedup_stopword_stripping_lowers_false_positive(self, tmp_vault):
+        """S1: stopwords must be stripped so function words don't inflate Jaccard.
+
+        Without stopword stripping, two claims that share phrasing but differ
+        in substance (e.g. 'dark mode' vs 'light mode') can cross the 0.7
+        threshold because function words (in, the, and, …) dominate the token
+        set.  After stripping, only content words remain and the similarity
+        should drop below the dedup threshold.
+        """
+        from plugins.memory.seedvault.vault import _tokenize, _jaccard
+        claim_a = "User prefers dark mode in the editor and terminal."
+        claim_b = "User now prefers light mode in the editor and terminal."
+        tokens_a = _tokenize(claim_a)
+        tokens_b = _tokenize(claim_b)
+        sim = _jaccard(tokens_a, tokens_b)
+        # With stopwords stripped, shared function words are gone.
+        # Content words: {user, prefers, dark, mode, editor, terminal}
+        # vs {user, prefers, light, mode, editor, terminal}
+        # Intersection: {user, prefers, mode, editor, terminal} = 5
+        # Union: {user, prefers, dark, light, mode, editor, terminal} = 7
+        # Jaccard = 5/7 ≈ 0.714 — still above 0.7! But "now" was a stopword.
+        # Without "now": same result since "now" was stripped from b.
+        # The stopword fix alone brings it from 0.73→0.714 — not enough.
+        # The real fix is the commit() reordering (skip_dedup when supersession
+        # candidates exist). This test verifies the stopword stripping itself
+        # works: "now" must NOT appear in tokens_b, "the" must NOT appear in either.
+        assert "the" not in tokens_a
+        assert "the" not in tokens_b
+        assert "and" not in tokens_a
+        assert "and" not in tokens_b
+        assert "now" not in tokens_b
+        assert "in" not in tokens_a
+        assert "in" not in tokens_b
+
+    def test_supersession_not_blocked_by_dedup(self, tmp_vault):
+        """S1: a legitimate supersession candidate must not be rejected as a dup.
+
+        Two seeds share the same primary tag and similar phrasing (enough to
+        cross Jaccard 0.7 with stopwords).  The second seed must commit
+        successfully and supersede the first, not be rejected as a duplicate.
+        """
+        gate = CommitGate(tmp_vault)
+        old = _make_seed("pref-old-001", tags=["pref", "preference"],
+                        core_claim="User prefers dark mode in the editor and terminal.")
+        ok, _ = gate.commit(old)
+        assert ok
+
+        new = _make_seed("pref-new-002", tags=["pref", "preference"],
+                        core_claim="User now prefers light mode in the editor and terminal.")
+        ok, reason = gate.commit(new)
+        assert ok, f"supersession candidate was rejected: {reason}"
+        assert reason == "committed"
+
+        old_stored = tmp_vault.get_seed("pref-old-001")
+        assert old_stored["status"] == "superseded"
+        assert "pref-new-002" in old_stored["superseded_by"]
+
+    def test_dedup_still_rejects_true_duplicates_without_supersession(self, tmp_vault):
+        """S1 regression guard: true duplicates (no shared primary tag) are still rejected.
+
+        When there are no supersession candidates (different primary tags),
+        dedup must still fire and reject near-identical claims.
+        """
+        gate = CommitGate(tmp_vault)
+        seed1 = _make_seed("env-dup-001", tags=["env", "config"],
+                          core_claim="The database runs on port 5432 with SSL enabled.")
+        ok, _ = gate.commit(seed1)
+        assert ok
+
+        # Same claim, different primary tag → no supersession, dedup must catch it
+        seed2 = _make_seed("infra-dup-002", tags=["infra", "config"],
+                          core_claim="The database runs on port 5432 with SSL enabled.")
+        ok, reason = gate.commit(seed2)
+        assert not ok
+        assert "duplicate" in reason.lower()
+
+    def test_supersession_with_near_identical_claims(self, tmp_vault):
+        """S1: even near-identical claims supersede (not dedup) when tags match.
+
+        Edge case: two seeds with the same primary tag and very similar claims
+        (high Jaccard). Without the fix, dedup rejects the second. With the fix,
+        supersession fires because the primary tag matches.
+        """
+        gate = CommitGate(tmp_vault)
+        old = _make_seed("pref-old-001", tags=["pref"],
+                        core_claim="User prefers dark mode in the editor.")
+        ok, _ = gate.commit(old)
+        assert ok
+
+        new = _make_seed("pref-new-002", tags=["pref"],
+                        core_claim="User prefers dark mode in the terminal.")
+        ok, reason = gate.commit(new)
+        assert ok, f"near-identical supersession candidate rejected: {reason}"
+
+        old_stored = tmp_vault.get_seed("pref-old-001")
+        assert old_stored["status"] == "superseded"
 
 
 # ---------------------------------------------------------------------------

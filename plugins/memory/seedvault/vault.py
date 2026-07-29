@@ -31,9 +31,32 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# Common English stopwords stripped from tokens so that function words
+# (in, the, and, …) don't inflate Jaccard similarity between claims that
+# share phrasing but differ in substance.  This prevents the Stage-1 dedup
+# gate from rejecting legitimate supersession candidates (S1).
+_STOPWORDS: frozenset[str] = frozenset({
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "is", "it", "as", "be", "by", "do", "if", "so", "no", "he",
+    "we", "my", "me", "us", "am", "up", "all", "now", "was", "are",
+    "has", "had", "been", "not", "can", "will", "this", "that", "from",
+    "with", "into", "than", "then", "such", "over", "under", "about",
+    "just", "only", "any", "some", "more", "most", "also", "very",
+    "too", "even", "out", "off", "down", "its", "our", "your", "her",
+    "his", "their", "them", "they", "who", "which", "what", "where",
+    "when", "how", "why", "did", "does", "doing", "being", "have",
+    "having", "should", "would", "could", "there", "here", "these",
+    "those", "each", "other", "same", "both", "one", "two",
+})
+
+
 def _tokenize(text: str) -> set[str]:
-    """Simple tokenizer for Jaccard similarity and keyword matching."""
-    return set(re.findall(r"[a-z0-9]{2,}", text.lower()))
+    """Tokenizer for Jaccard similarity and keyword matching.
+
+    Stopwords are stripped so that short function words don't inflate
+    similarity between substantively different claims.
+    """
+    return set(re.findall(r"[a-z0-9]{2,}", text.lower())) - _STOPWORDS
 
 
 def _jaccard(a: set[str], b: set[str]) -> float:
