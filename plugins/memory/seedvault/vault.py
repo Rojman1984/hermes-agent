@@ -77,9 +77,18 @@ class SeedVault:
         return {"seeds": {}, "version": 1, "updated": _utc_now()}
 
     def _save_manifest(self) -> None:
-        """Save manifest with exclusive file lock + atomic replace."""
+        """Save manifest with exclusive file lock + atomic replace.
+
+        Uses a per-writer unique tmp filename (includes PID + thread ID) so
+        concurrent writers don't clobber each other's tmp file before
+        os.replace() runs. The flock serialises the actual writes; the unique
+        tmp name prevents the race where writer A's os.replace() unlinks the
+        tmp file that writer B is still writing to.
+        """
         self._manifest["updated"] = _utc_now()
-        tmp_path = self.manifest_path.with_suffix(".tmp")
+        tmp_path = self.manifest_path.with_suffix(
+            f".{os.getpid()}.{threading.get_ident()}.tmp"
+        )
         with open(tmp_path, "w") as f:
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
             try:
@@ -122,6 +131,11 @@ class SeedVault:
         """Atomically write a seed file and update manifest.
         
         Returns True on success, False on failure.
+
+        Concurrency: the seed file is written atomically (unique tmp + replace).
+        The manifest update is protected by a dedicated lock file that covers
+        the full read-modify-write cycle, so concurrent writers don't lose
+        each other's entries.
         """
         seed_id = seed.get("id", "")
         if not seed_id:
@@ -129,7 +143,7 @@ class SeedVault:
             return False
 
         path = self.seeds_dir / f"{seed_id}.json"
-        tmp_path = path.with_suffix(".tmp")
+        tmp_path = path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
 
         try:
             with open(tmp_path, "w") as f:
@@ -141,14 +155,27 @@ class SeedVault:
             logger.error("SeedVault: failed to write seed %s: %s", seed_id, e)
             return False
 
-        with self._lock:
-            self._manifest.setdefault("seeds", {})[seed_id] = {
-                "status": seed.get("status", "active"),
-                "tags": seed.get("tags", []),
-                "trust_score": seed.get("trust_score", 0.0),
-                "updated": seed.get("updated", _utc_now()),
-            }
-            self._save_manifest()
+        # Lock the entire manifest read-modify-write cycle with a dedicated
+        # lock file.  This prevents the race where process A loads the manifest,
+        # process B loads the same manifest, A adds its seed and saves, then B
+        # adds its seed and saves — clobbering A's entry.  The lock file is
+        # separate from the manifest itself so it survives os.replace().
+        lock_path = self.manifest_path.with_suffix(".lock")
+        with open(lock_path, "w") as lock_f:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+            try:
+                # Re-read the manifest from disk in case another writer changed it
+                disk_manifest = self._load_manifest()
+                disk_manifest.setdefault("seeds", {})[seed_id] = {
+                    "status": seed.get("status", "active"),
+                    "tags": seed.get("tags", []),
+                    "trust_score": seed.get("trust_score", 0.0),
+                    "updated": seed.get("updated", _utc_now()),
+                }
+                self._manifest = disk_manifest
+                self._save_manifest()
+            finally:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
         return True
 
     def update_seed(self, seed_id: str, updates: Dict[str, Any]) -> bool:
@@ -192,10 +219,18 @@ class SeedVault:
         except OSError as e:
             logger.error("SeedVault: failed to archive seed %s: %s", seed_id, e)
             return False
-        with self._lock:
-            if seed_id in self._manifest.get("seeds", {}):
-                self._manifest["seeds"][seed_id]["status"] = "archived"
-                self._save_manifest()
+        # Use the manifest lock file for cross-process safety (same as write_seed)
+        lock_path = self.manifest_path.with_suffix(".lock")
+        with open(lock_path, "w") as lock_f:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+            try:
+                disk_manifest = self._load_manifest()
+                if seed_id in disk_manifest.get("seeds", {}):
+                    disk_manifest["seeds"][seed_id]["status"] = "archived"
+                    self._manifest = disk_manifest
+                    self._save_manifest()
+            finally:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
         return True
 
     # -- Supersession -------------------------------------------------------
@@ -307,8 +342,17 @@ class SeedVault:
         }
 
     def save_digest(self, digest: Dict[str, Any]) -> None:
-        """Save the state digest with exclusive file lock."""
-        with open(self.digest_path, "w") as f:
+        """Save the state digest with exclusive file lock + atomic replace.
+
+        Uses a per-writer unique tmp filename (includes PID + thread ID) so
+        concurrent writers don't clobber each other's tmp file or the live
+        digest file. Without this, two writers opening the same path for "w"
+        would truncate each other's data mid-write.
+        """
+        tmp_path = self.digest_path.with_suffix(
+            f".{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        with open(tmp_path, "w") as f:
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
             try:
                 json.dump(digest, f, indent=2, ensure_ascii=False)
@@ -316,6 +360,7 @@ class SeedVault:
                 os.fsync(f.fileno())
             finally:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        os.replace(tmp_path, self.digest_path)
 
     # -- Retrieval (v1: keyword/tag matching) --------------------------------
 
