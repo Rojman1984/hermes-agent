@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MemorySeed",
+  "description": "A compact structured memory unit adapted from MindSeed's seed_contract. Unlike MindSeed seeds (build-time authored, validated offline), SeedVault seeds are extracted at runtime from live conversation during compression events. See DESIGN.md for paradigm differences.",
+  "type": "object",
+  "required": ["id", "core_claim", "source_ref", "trust_score", "trust_history", "status", "tags", "created", "updated"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+-[a-z0-9]+-[0-9]{3,}$",
+      "description": "Domain-topic-NNN format, e.g. env-ollama-001"
+    },
+    "core_claim": {
+      "type": "string",
+      "maxLength": 500,
+      "minLength": 1,
+      "description": "The essential fact that must survive compaction"
+    },
+    "chunks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["type", "content"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["constraint", "status", "decision", "insight", "preference", "error"]
+          },
+          "content": {
+            "type": "string",
+            "maxLength": 1000
+          }
+        }
+      },
+      "description": "Typed sub-facts supporting the core claim"
+    },
+    "meristems": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["type", "target"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["prerequisite", "nextstep", "bridge", "supersedes", "related"]
+          },
+          "target": {
+            "type": "string",
+            "description": "Seed ID this edge points to (must exist)"
+          }
+        }
+      },
+      "description": "Typed relationship edges to other seeds"
+    },
+    "source_ref": {
+      "type": "object",
+      "required": ["session_id"],
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "description": "Session DB ID where this seed was extracted from"
+        },
+        "profile": {
+          "type": "string",
+          "default": "default"
+        },
+        "message_id": {
+          "type": "integer",
+          "description": "Optional: specific message ID in session DB"
+        }
+      },
+      "description": "Canonical source provenance — links back to session DB"
+    },
+    "trust_score": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0,
+      "description": "Computed trust score. Reconciliation: initial_value + sum(deltas) must equal this field."
+    },
+    "trust_history": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["reason", "at"],
+        "properties": {
+          "delta": {
+            "type": ["number", "null"],
+            "description": "Change from previous score. null for the initial entry."
+          },
+          "value": {
+            "type": ["number", "null"],
+            "description": "Absolute score after this entry. Required for initial entry (delta=null)."
+          },
+          "reason": {
+            "type": "string",
+            "enum": ["initial", "provenance_verified", "explicit_positive", "drift_detected", "superseded", "age_decay"]
+          },
+          "at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "description": "Audit trail of trust score changes"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["active", "superseded", "archived"],
+      "default": "active"
+    },
+    "superseded_by": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Seed IDs that supersede this one. Empty when status=active."
+    },
+    "superseded_at": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "When this seed was first superseded. null when status=active."
+    },
+    "tags": {
+      "type": "array",
+      "items": {"type": "string"},
+      "minItems": 1,
+      "description": "Domain tags. First tag is the primary domain (used for supersession matching)."
+    },
+    "created": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "last_validated": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "Last time Stage 2 validation ran. null if never validated."
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "StateDigest",
+  "description": "Compact carry-forward state surviving compaction boundaries. Adapted from MindSeed's state_digest concept. Written before compaction, read after compaction.",
+  "type": "object",
+  "required": ["current_task", "active_seed_ids", "compaction_count", "last_compaction", "session_lineage"],
+  "properties": {
+    "current_task": {
+      "type": "string",
+      "description": "What the agent is currently working on"
+    },
+    "active_seed_ids": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Seed IDs relevant to the current session"
+    },
+    "pending_actions": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Remaining steps in the current task"
+    },
+    "compaction_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How many compactions have occurred in this session lineage"
+    },
+    "last_compaction": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Timestamp of the most recent compaction"
+    },
+    "session_lineage": {
+      "type": "array",
+      "items": {"type": "string"},
+      "minItems": 1,
+      "description": "Chain of session IDs from oldest to current"
+    }
+  },
+  "additionalProperties": false
+}
