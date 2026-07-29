@@ -271,10 +271,12 @@ class SeedVault:
             old_seed["status"] = "superseded"
             old_seed.setdefault("superseded_by", []).append(new_seed_id)
             old_seed["superseded_at"] = now
+            pre_zero_score = old_seed.get("trust_score", 0.0)
             old_seed["trust_score"] = 0.0
             old_seed["trust_history"].append({
-                "delta": -old_seed.get("trust_score", 0.0),
+                "delta": -pre_zero_score,
                 "reason": "superseded",
+                "value": 0.0,
                 "at": now,
             })
             old_seed["updated"] = now

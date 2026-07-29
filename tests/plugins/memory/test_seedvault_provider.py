@@ -281,6 +281,46 @@ class TestTrustScore:
         stored = tmp_vault.get_seed("env-test-001")
         assert stored["trust_score"] == 1.0
 
+    def test_supersession_trust_delta_is_pre_zero_score(self, tmp_vault):
+        """B1: supersede_seeds must capture trust_score before zeroing it.
+
+        The delta in the supersession trust_history entry must equal the
+        pre-supersession trust_score (negated), not -0.0.
+        """
+        seed = _make_seed(trust_score=0.8)
+        tmp_vault.write_seed(seed)
+        tmp_vault.supersede_seeds("new-001", ["env-test-001"])
+        stored = tmp_vault.get_seed("env-test-001")
+        supersede_entry = stored["trust_history"][-1]
+        assert supersede_entry["reason"] == "superseded"
+        assert supersede_entry["delta"] == pytest.approx(-0.8)
+        assert supersede_entry["value"] == pytest.approx(0.0)
+        assert stored["trust_score"] == pytest.approx(0.0)
+
+    def test_supersession_trust_reconciliation(self, tmp_vault):
+        """B1: initial_value + sum(deltas) == trust_score after supersession."""
+        seed = _make_seed(trust_score=0.8)
+        tmp_vault.write_seed(seed)
+        # Apply an adjustment first so history has >2 entries
+        tmp_vault.adjust_trust("env-test-001", +0.1, "provenance_verified")
+        tmp_vault.supersede_seeds("new-001", ["env-test-001"])
+        stored = tmp_vault.get_seed("env-test-001")
+        initial_value = stored["trust_history"][0]["value"]
+        total_delta = sum(
+            e["delta"] for e in stored["trust_history"] if e["delta"] is not None
+        )
+        assert pytest.approx(initial_value + total_delta) == stored["trust_score"]
+
+    def test_supersession_value_field_present(self, tmp_vault):
+        """B1: supersession entry must include 'value' field (schema consistency)."""
+        seed = _make_seed(trust_score=0.8)
+        tmp_vault.write_seed(seed)
+        tmp_vault.supersede_seeds("new-001", ["env-test-001"])
+        stored = tmp_vault.get_seed("env-test-001")
+        supersede_entry = stored["trust_history"][-1]
+        assert "value" in supersede_entry
+        assert supersede_entry["value"] == pytest.approx(0.0)
+
 
 # ---------------------------------------------------------------------------
 # Extractor tests
