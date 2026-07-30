@@ -33,7 +33,7 @@ from .vault import SeedVault
 from .validator import CommitGate
 from .state_digest import StateDigestManager
 from .extractor import extract_seeds
-from .scrub import get_scrub_patterns, scrub_text
+from .scrub import get_scrub_patterns, scrub_text, scrub_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -315,8 +315,13 @@ class SeedVaultMemoryProvider(MemoryProvider):
             ok, reason = self._gate.commit(raw_seed)
             if ok:
                 committed.append(raw_seed)
-                # Stage 2 validation against source messages
-                self._gate.stage2_validate(raw_seed, messages)
+                # Stage 2 validation against source messages.
+                # Phase 8.3: artifact seeds skip Stage-2 drift check (approved
+                # deviation 4.3) — hash equality is a stronger guarantee than
+                # token-overlap drift checking for a short description.
+                has_artifacts = bool(raw_seed.get("artifacts"))
+                if not has_artifacts:
+                    self._gate.stage2_validate(raw_seed, messages)
             else:
                 rejected += 1
                 logger.debug("SeedVault: seed rejected: %s — %s",
@@ -505,6 +510,20 @@ class SeedVaultMemoryProvider(MemoryProvider):
                     "required": [],
                 },
             },
+            {
+                "name": "seedvault_get_artifact",
+                "description": "Retrieve the raw content of an artifact (code block, shell command, diff) by its blob hash. The agent calls this when it needs the exact verbatim bytes of a captured artifact.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "blob_hash": {
+                            "type": "string",
+                            "description": "The SHA-256 hash of the artifact blob (from a seed's artifacts array).",
+                        },
+                    },
+                    "required": ["blob_hash"],
+                },
+            },
         ]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
@@ -556,6 +575,34 @@ class SeedVaultMemoryProvider(MemoryProvider):
                     "current_task": digest.get("current_task", "")[:100],
                 },
             }, indent=2)
+
+        elif tool_name == "seedvault_get_artifact":
+            # Phase 8.3: retrieve raw artifact bytes by blob hash.
+            if not self._vault:
+                return json.dumps({"error": "vault not initialized"})
+            blob_hash = args.get("blob_hash", "")
+            if not blob_hash:
+                return json.dumps({"error": "blob_hash is required"})
+            blob_bytes = self._vault.blob_store.read_blob(blob_hash)
+            if blob_bytes is None:
+                return json.dumps({"error": f"artifact not found: {blob_hash[:12]}..."})
+            # Phase 8a: scrub-on-retrieval — redact secrets before serving.
+            scrub_patterns = get_scrub_patterns()
+            if scrub_patterns:
+                blob_bytes, n = scrub_bytes(blob_bytes, scrub_patterns)
+                if n > 0:
+                    logger.debug(
+                        "SeedVault: scrubbed %d secret(s) from artifact %s",
+                        n,
+                        blob_hash[:12],
+                    )
+            # Return as text (code/config are text). If non-UTF-8, base64.
+            try:
+                content = blob_bytes.decode("utf-8")
+                return content
+            except UnicodeDecodeError:
+                import base64
+                return base64.b64encode(blob_bytes).decode("ascii")
 
         raise NotImplementedError(f"SeedVault does not handle tool {tool_name}")
 

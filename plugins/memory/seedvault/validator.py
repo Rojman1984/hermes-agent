@@ -41,6 +41,28 @@ class CommitGate:
     def __init__(self, vault: SeedVault):
         self.vault = vault
 
+    def find_duplicate_artifact(self, blob_hash: str, seed_id: str = "") -> Optional[str]:
+        """Find an existing seed with the same artifact blob hash.
+
+        Exact hash lookup against the blob index — no Jaccard, no threshold.
+        Returns the existing seed ID if the same blob hash is already in
+        the vault AND belongs to a DIFFERENT seed, None otherwise.
+        (Phase 8.3)
+
+        The seed_id parameter excludes self-matches: when a blob was
+        written at extraction time with the same seed_id, it's not a
+        duplicate — it's the same seed's own artifact.
+        """
+        if not blob_hash:
+            return None
+        meta = self.vault.blob_store.get_blob_metadata(blob_hash)
+        if meta is not None:
+            existing_seed_id = meta.get("seed_id", "")
+            # Don't count it as a duplicate if it's the same seed
+            if existing_seed_id and existing_seed_id != seed_id:
+                return existing_seed_id
+        return None
+
     def stage1_validate(self, seed: Dict[str, Any], skip_dedup: bool = False) -> tuple[bool, str]:
         """Deterministic validation. Returns (passed, reason).
 
@@ -82,26 +104,49 @@ class CommitGate:
         Handles supersession: if an active seed with the same primary tag exists,
         the new seed supersedes it.
         
+        For artifact seeds (seeds with non-empty ``artifacts`` array): uses
+        exact-hash dedup via ``find_duplicate_artifact()`` instead of the
+        Jaccard path.  The blob was already written at extraction time, so
+        we check the hash against the index. (Phase 8.3)
+        
         Returns (committed, reason).
         """
-        # Check for supersession candidates BEFORE Stage-1 dedup so that a
-        # legitimate "same domain, updated claim" seed is not rejected as a
-        # duplicate before supersession fires (S1).  However, we only skip
-        # dedup when the new claim is NOT a near-identical copy of an existing
-        # candidate — a literal resubmission (Jaccard >= 0.95) is still a
-        # duplicate and must be rejected, not silently superseded.
-        candidates = self.vault.find_superseded_candidates(seed)
-        claim = seed.get("core_claim", "")
-        skip_dedup = False
-        if candidates:
-            # Skip dedup only if no candidate is a near-duplicate.
-            near_dup = self.vault.find_duplicate(claim, threshold=0.95)
-            skip_dedup = near_dup is None
+        # Phase 8.3: artifact seeds use exact-hash dedup, not Jaccard.
+        artifacts = seed.get("artifacts", [])
+        is_artifact_seed = bool(artifacts)
+        candidates: list[str] = []  # supersession candidates (prose seeds only)
 
-        passed, reason = self.stage1_validate(seed, skip_dedup=skip_dedup)
-        if not passed:
-            logger.warning("SeedVault: seed rejected by Stage 1 gate: %s", reason)
-            return False, reason
+        if is_artifact_seed:
+            # Check for exact-hash duplicate
+            for art in artifacts:
+                blob_hash = art.get("blob_hash", "")
+                dup_seed_id = self.find_duplicate_artifact(blob_hash, seed.get("id", ""))
+                if dup_seed_id is not None:
+                    return False, (
+                        f"duplicate artifact (blob hash {blob_hash[:12]}... "
+                        f"matches seed {dup_seed_id})"
+                    )
+            # Artifact seeds skip the Jaccard dedup path entirely.
+            # They still pass the other Stage-1 checks (core_claim non-empty,
+            # provenance, meristem validation).
+            passed, reason = self.stage1_validate(seed, skip_dedup=True)
+            if not passed:
+                logger.warning("SeedVault: artifact seed rejected by Stage 1: %s", reason)
+                return False, reason
+        else:
+            # Prose seeds: existing supersession + Jaccard path (unchanged)
+            candidates = self.vault.find_superseded_candidates(seed)
+            claim = seed.get("core_claim", "")
+            skip_dedup = False
+            if candidates:
+                # Skip dedup only if no candidate is a near-duplicate.
+                near_dup = self.vault.find_duplicate(claim, threshold=0.95)
+                skip_dedup = near_dup is None
+
+            passed, reason = self.stage1_validate(seed, skip_dedup=skip_dedup)
+            if not passed:
+                logger.warning("SeedVault: seed rejected by Stage 1 gate: %s", reason)
+                return False, reason
 
         # Initialize trust score if not set
         if "trust_score" not in seed:
