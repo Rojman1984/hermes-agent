@@ -301,6 +301,7 @@ class SeedVaultMemoryProvider(MemoryProvider):
             session_id=self._session_id,
             profile=self._profile,
             llm_caller=llm_caller,
+            blob_store=self._vault.blob_store if self._vault else None,
         )
 
         if not raw_seeds:

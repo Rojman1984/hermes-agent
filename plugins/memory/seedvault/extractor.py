@@ -17,9 +17,9 @@ import json
 import logging
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from .scrub import get_scrub_patterns, scrub_text
+from .scrub import get_scrub_patterns, scrub_text, scrub_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -47,10 +47,253 @@ _PATTERNS = [
 ]
 
 
-def _heuristic_extract(messages: List[Dict[str, Any]], session_id: str, profile: str) -> List[Dict[str, Any]]:
+# -- Artifact detection (Phase 8.2) -----------------------------------------
+
+# Known shell command prefixes for detecting shell commands in prose.
+# Conservative: false negatives (missed commands) are acceptable; false
+# positives (prose flagged as commands) are not.
+_SHELL_PREFIXES = frozenset({
+    "systemctl", "apt", "pip", "npm", "git", "docker", "curl", "ssh",
+    "cd", "ls", "cp", "mv", "rm", "mkdir", "chmod", "chown", "export",
+    "source", "sudo", "python3", "python", "node", "brew", "snap",
+    "wget", "tar", "unzip", "cat", "echo", "grep", "find", "sed",
+    "awk", "head", "tail", "wc", "sort", "uniq", "diff", "patch",
+    "make", "cmake", "gcc", "cargo", "rustc", "go", "java", "javac",
+})
+
+# Config language tags for fenced blocks
+_CONFIG_LANGS = frozenset({"yaml", "yml", "json", "toml", "ini", "env", "conf"})
+
+# Code fence regex: ```lang\n...\n```
+_CODE_FENCE_RE = re.compile(
+    r"```(\w*)\n(.*?)```",
+    re.DOTALL,
+)
+
+
+def _detect_artifacts(content: str) -> List[Dict[str, Any]]:
+    """Detect reproducible artifacts in message content.
+
+    Detects:
+    - Fenced code blocks: ```lang ... ``` — captures the exact span
+      between fences, including the language tag.
+    - Shell command lines: lines starting with `$ ` or lines matching
+      a recognizable command-line shape (known prefix + args).
+    - Diff blocks: fenced blocks with `diff` language tag or content
+      starting with @@/+++/---.
+
+    Returns a list of artifact dicts, each with:
+    - raw_content: the exact bytes to store in the blob
+    - content_type: "bash", "code", "diff", or "config"
+    - language: the fence language tag (str or None)
+    - description: a short human-readable description for core_claim
+
+    Does NOT write blobs — the caller is responsible for writing blobs
+    via the vault's blob store and attaching artifact pointers to seeds.
+    """
+    artifacts: List[Dict[str, Any]] = []
+    consumed_spans: List[Tuple[int, int]] = []  # ranges already captured by fences
+
+    # 1. Detect fenced code blocks
+    for match in _CODE_FENCE_RE.finditer(content):
+        lang = match.group(1).lower() or ""
+        raw = match.group(2)
+        # Strip trailing newline that the fence regex captures
+        if raw.endswith("\n"):
+            raw = raw[:-1]
+
+        # Classify the content type
+        if lang == "diff" or raw.lstrip().startswith(("@@", "+++", "---")):
+            content_type = "diff"
+            desc = _describe_diff(raw)
+        elif lang in ("bash", "sh", "shell", "zsh"):
+            content_type = "bash"
+            desc = f"Bash command: {_short_desc(raw.strip().splitlines()[0] if raw.strip() else '')}"
+        elif lang in _CONFIG_LANGS:
+            content_type = "config"
+            desc = f"{lang.upper()} config block"
+        elif lang:
+            content_type = "code"
+            desc = f"{lang} code block"
+        else:
+            # No language tag — check if it looks like a shell command
+            first_line = raw.strip().split("\n")[0] if raw.strip() else ""
+            if _is_shell_command(first_line):
+                content_type = "bash"
+                desc = f"Bash command: {_short_desc(first_line)}"
+            else:
+                content_type = "code"
+                desc = f"Code block: {_short_desc(first_line)}"
+
+        artifacts.append({
+            "raw_content": raw,
+            "content_type": content_type,
+            "language": lang or None,
+            "description": desc,
+        })
+        consumed_spans.append((match.start(), match.end()))
+
+    # 2. Detect shell command lines (outside code fences)
+    for line in content.splitlines():
+        # Skip if this line is inside a code fence we already captured
+        line_start = content.index(line) if line in content else -1
+        if line_start >= 0:
+            inside_fence = any(
+                s <= line_start < e for s, e in consumed_spans
+            )
+            if inside_fence:
+                continue
+
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # Shell prompt convention: `$ command`
+        if stripped.startswith("$ "):
+            cmd = stripped[2:]
+            if cmd and not cmd.startswith("#"):  # skip comments
+                artifacts.append({
+                    "raw_content": cmd,
+                    "content_type": "bash",
+                    "language": None,
+                    "description": f"Bash command: {_short_desc(cmd)}",
+                })
+        elif _is_shell_command(stripped):
+            artifacts.append({
+                "raw_content": stripped,
+                "content_type": "bash",
+                "language": None,
+                "description": f"Bash command: {_short_desc(stripped)}",
+            })
+
+    return artifacts
+
+
+def _is_shell_command(line: str) -> bool:
+    """Check if a line looks like a shell command.
+
+    Conservative: only matches lines starting with a known command prefix
+    followed by arguments. Does not match prose that merely mentions a
+    command name.
+    """
+    # Skip lines that are clearly prose (end with period, are sentences)
+    if line.endswith(".") and len(line.split()) > 3:
+        return False
+    # Skip if it starts with a quote (prose)
+    if line.startswith(('"', "'")):
+        return False
+
+    parts = line.split()
+    if not parts:
+        return False
+    # Get the base command (handle sudo, env vars)
+    cmd_idx = 0
+    while cmd_idx < len(parts) and "=" in parts[cmd_idx]:
+        cmd_idx += 1
+    if cmd_idx >= len(parts):
+        return False
+    base = parts[cmd_idx]
+    # Strip any path prefix
+    base_name = base.rsplit("/", 1)[-1]
+    return base_name in _SHELL_PREFIXES
+
+
+def _short_desc(text: str, max_len: int = 60) -> str:
+    """Create a short description from the first line of content."""
+    first_line = text.strip().split("\n")[0]
+    if len(first_line) > max_len:
+        return first_line[:max_len - 3] + "..."
+    return first_line
+
+
+def _describe_diff(raw: str) -> str:
+    """Create a description for a diff block."""
+    first_line = raw.strip().split("\n")[0]
+    if first_line.startswith("@@"):
+        return f"Diff: {first_line[:50]}"
+    return "Diff block"
+
+
+def _strip_code_fences(content: str) -> str:
+    """Replace code fences with a placeholder for pattern matching.
+
+    This prevents prose patterns from matching inside code blocks (e.g.
+    a comment `# must stay OFF` inside a code fence matching the
+    "constraint" pattern). The original content is preserved for blob
+    extraction — this is only used for the pattern-matching pass.
+    """
+    return _CODE_FENCE_RE.sub("[code artifact captured]", content)
+
+
+def _make_artifact_seed(
+    artifact: Dict[str, Any],
+    session_id: str,
+    profile: str,
+    seed_index: int,
+) -> Dict[str, Any]:
+    """Create a seed dict from a detected artifact.
+
+    One seed per artifact (per approved design decision 5.7).
+    The core_claim is a short description, NOT the raw content.
+    The raw content lives in the blob store (written by the caller).
+    """
+    desc = artifact["description"]
+    content_type = artifact["content_type"]
+    lang = artifact.get("language") or ""
+
+    # Domain tag from content type
+    domain = "artifact"
+    if content_type == "bash":
+        domain = "shell"
+    elif content_type == "code":
+        domain = "code"
+    elif content_type == "diff":
+        domain = "diff"
+    elif content_type == "config":
+        domain = "config"
+
+    return {
+        "id": _make_seed_id(domain, content_type, seed_index),
+        "core_claim": desc[:500],
+        "chunks": [{
+            "type": "insight",
+            "content": f"Artifact type: {content_type}, language: {lang or 'none'}",
+        }],
+        "meristems": [],
+        "source_ref": {
+            "session_id": session_id,
+            "profile": profile,
+        },
+        "trust_score": 0.8,
+        "trust_history": [{
+            "delta": None,
+            "reason": "initial",
+            "value": 0.8,
+            "at": _utc_now(),
+        }],
+        "status": "active",
+        "superseded_by": [],
+        "superseded_at": None,
+        "tags": [domain, content_type],
+        "created": _utc_now(),
+        "updated": _utc_now(),
+        "last_validated": None,
+        # Artifacts array will be attached by the caller after blob write
+        "artifacts": [],
+    }
+
+
+def _heuristic_extract(
+    messages: List[Dict[str, Any]],
+    session_id: str,
+    profile: str,
+    blob_store: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
     """Pattern-based seed extraction. Fallback when no LLM available.
     
     Scans user and assistant messages for durable-fact patterns.
+    Also detects reproducible artifacts (code blocks, shell commands, diffs)
+    and creates one seed per artifact with a blob pointer.
     Returns raw seed dicts (pre-gate, pre-validation).
     """
     raw_seeds: List[Dict[str, Any]] = []
@@ -70,20 +313,64 @@ def _heuristic_extract(messages: List[Dict[str, Any]], session_id: str, profile:
         if not isinstance(content, str) or not content.strip():
             continue
 
+        # Phase 8.2: detect artifacts first
+        artifacts = _detect_artifacts(content)
+        for artifact in artifacts:
+            seed_counter += 1
+            seed = _make_artifact_seed(artifact, session_id, profile, seed_counter)
+            # Write blob if blob_store is available
+            if blob_store is not None:
+                raw_bytes = artifact["raw_content"].encode("utf-8")
+                # Phase 8a: scrub blob bytes before writing
+                scrub_patterns = get_scrub_patterns()
+                if scrub_patterns:
+                    raw_bytes, scrub_count = scrub_bytes(raw_bytes, scrub_patterns)
+                    if scrub_count > 0:
+                        logger.debug(
+                            "SeedVault: scrubbed %d secret(s) from artifact blob",
+                            scrub_count,
+                        )
+                blob_hash = blob_store.write_blob(
+                    raw_bytes=raw_bytes,
+                    seed_id=seed["id"],
+                    content_type=artifact["content_type"],
+                    language=artifact.get("language"),
+                )
+                if blob_hash is not None:
+                    seed["artifacts"] = [{
+                        "blob_hash": blob_hash,
+                        "content_type": artifact["content_type"],
+                        "language": artifact.get("language"),
+                        "byte_length": len(raw_bytes),
+                    }]
+                else:
+                    # Blob write failed (oversized or error) — drop artifact
+                    # pointer but keep the seed (prose description survives)
+                    seed["artifacts"] = []
+                    logger.warning(
+                        "SeedVault: blob write failed for artifact seed %s, "
+                        "committing seed without artifact pointer",
+                        seed["id"],
+                    )
+            raw_seeds.append(seed)
+
+        # Run prose patterns on content with code fences stripped
+        # (prevents patterns matching inside code blocks)
+        prose_content = _strip_code_fences(content) if artifacts else content
+
         for pattern, chunk_type, domain in _PATTERNS:
-            for match in re.finditer(pattern, content, re.IGNORECASE):
-                # Capture the full sentence containing the match, not just the fragment
-                # Find sentence boundaries around the match position
-                start = content.rfind(". ", 0, match.start())
-                start = start + 2 if start >= 0 else max(0, content.rfind("\n", 0, match.start()) + 1)
-                end = content.find(". ", match.end())
+            for match in re.finditer(pattern, prose_content, re.IGNORECASE):
+                # Capture the full sentence containing the match
+                start = prose_content.rfind(". ", 0, match.start())
+                start = start + 2 if start >= 0 else max(0, prose_content.rfind("\n", 0, match.start()) + 1)
+                end = prose_content.find(". ", match.end())
                 if end < 0:
-                    end = content.find("\n", match.end())
+                    end = prose_content.find("\n", match.end())
                 if end < 0:
-                    end = len(content)
+                    end = len(prose_content)
                 else:
                     end += 1  # include the period
-                claim = content[start:end].strip()[:500]
+                claim = prose_content[start:end].strip()[:500]
                 if len(claim) < 10:
                     continue
 
@@ -275,11 +562,17 @@ def extract_seeds(
     session_id: str,
     profile: str = "default",
     llm_caller: Optional[Any] = None,
+    blob_store: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     """Extract seeds from conversation messages.
     
     Uses LLM-assisted extraction if llm_caller is provided, otherwise
     falls back to heuristic pattern matching.
+    
+    blob_store: optional BlobStore instance for writing artifact blobs.
+    When provided, the heuristic extractor writes detected artifacts
+    (code blocks, shell commands, diffs) to the blob store and attaches
+    artifact pointers to the seed dicts. (Phase 8.2)
     
     Returns raw seed dicts — they still need to pass the commit gate
     (validator.py) before landing in the vault.
@@ -316,4 +609,4 @@ def extract_seeds(
             return seeds
         # Fall through to heuristic if LLM returned nothing
 
-    return _heuristic_extract(messages, session_id, profile)
+    return _heuristic_extract(messages, session_id, profile, blob_store=blob_store)

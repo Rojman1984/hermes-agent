@@ -19,12 +19,17 @@ import multiprocessing
 import os
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from plugins.memory.seedvault.vault import SeedVault
 from plugins.memory.seedvault.blobstore import BlobStore, DEFAULT_MAX_BLOB_BYTES
 from plugins.memory.seedvault.extractor import _utc_now
+from plugins.memory.seedvault.scrub import (
+    discover_secrets_from_env,
+    build_replacement_patterns,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +66,20 @@ def _make_minimal_seed() -> dict:
         "updated": _utc_now(),
         "last_validated": None,
     }
+
+
+@pytest.fixture
+def fake_env(tmp_path):
+    """Create a temporary .env file with known secrets for scrub tests."""
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "# Hermes credentials\n"
+        "OPENAI_API_KEY=sk-test-1234567890abcdef\n"
+        "GITHUB_TOKEN=ghp_abcdef1234567890abcdef\n"
+        "DATABASE_PASSWORD=s3cr3tp@ss\n"
+        "PLACEHOLDER_KEY=your_api_key_here\n"  # should be skipped
+    )
+    return env_path
 
 
 class TestSchemaValidation:
@@ -493,3 +512,211 @@ class TestBlobConcurrency:
         store = BlobStore(Path(vault_dir))
         assert store.count() == 5
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 8.2 — Artifact detection tests
+# ---------------------------------------------------------------------------
+
+from plugins.memory.seedvault.extractor import (
+    _detect_artifacts,
+    _strip_code_fences,
+    _make_artifact_seed,
+    extract_seeds,
+)
+
+
+class TestArtifactDetection:
+    """Test the _detect_artifacts() function."""
+
+    def test_code_fence_detection(self):
+        """A fenced code block with a language tag is detected as 'code'."""
+        content = "Here is some code:\n```python\ndef foo():\n    pass\n```\nDone."
+        artifacts = _detect_artifacts(content)
+        assert len(artifacts) == 1
+        assert artifacts[0]["content_type"] == "code"
+        assert artifacts[0]["language"] == "python"
+        assert "def foo():" in artifacts[0]["raw_content"]
+
+    def test_shell_command_detection(self):
+        """A shell command with $ prefix is detected as 'bash'."""
+        content = "Run this command:\n$ systemctl restart ollama\nDone."
+        artifacts = _detect_artifacts(content)
+        assert len(artifacts) == 1
+        assert artifacts[0]["content_type"] == "bash"
+        assert "systemctl restart ollama" in artifacts[0]["raw_content"]
+
+    def test_shell_command_no_prefix(self):
+        """A bare shell command (known prefix) is detected as 'bash'."""
+        content = "git push origin main"
+        artifacts = _detect_artifacts(content)
+        assert len(artifacts) == 1
+        assert artifacts[0]["content_type"] == "bash"
+
+    def test_diff_detection(self):
+        """A diff block is detected as 'diff'."""
+        content = "```diff\n@@ -1,3 +1,3 @@\n-old line\n+new line\n```"
+        artifacts = _detect_artifacts(content)
+        assert len(artifacts) == 1
+        assert artifacts[0]["content_type"] == "diff"
+        assert "@@ -1,3 +1,3 @@" in artifacts[0]["raw_content"]
+
+    def test_config_detection(self):
+        """A YAML config block is detected as 'config'."""
+        content = '```yaml\nserver:\n  port: 8080\n```'
+        artifacts = _detect_artifacts(content)
+        assert len(artifacts) == 1
+        assert artifacts[0]["content_type"] == "config"
+        assert artifacts[0]["language"] == "yaml"
+
+    def test_no_false_positives_prose(self):
+        """Prose mentioning 'code' or 'command' without actual code → no artifacts."""
+        content = "We should write some code to handle the command parsing logic."
+        artifacts = _detect_artifacts(content)
+        assert len(artifacts) == 0
+
+    def test_multiple_artifacts_in_one_message(self):
+        """Two code fences → two artifacts."""
+        content = (
+            "First:\n```python\nprint(1)\n```\n"
+            "Second:\n```bash\necho hello\n```"
+        )
+        artifacts = _detect_artifacts(content)
+        assert len(artifacts) == 2
+        assert artifacts[0]["content_type"] == "code"
+        assert artifacts[1]["content_type"] == "bash"
+
+    def test_artifact_and_prose_coexistence(self):
+        """A message with both a code fence and prose → artifact + prose pattern."""
+        content = (
+            "I prefer to use this command:\n```bash\nsystemctl restart ollama\n```\n"
+            "It always works."
+        )
+        artifacts = _detect_artifacts(content)
+        assert len(artifacts) == 1
+        assert artifacts[0]["content_type"] == "bash"
+        # Strip code fences and check prose pattern still matches
+        stripped = _strip_code_fences(content)
+        assert "[code artifact captured]" in stripped
+        assert "prefer" in stripped  # prose pattern still visible
+
+    def test_blob_content_is_exact(self, tmp_path):
+        """Blob content is byte-identical to the original span."""
+        vault = SeedVault(tmp_path / "vault")
+        content = "```python\nprint('hello world')\n```"
+        seeds = extract_seeds(
+            messages=[{"role": "user", "content": content}],
+            session_id="test-artifact-001",
+            profile="default",
+            blob_store=vault.blob_store,
+        )
+        # Find the artifact seed
+        artifact_seeds = [s for s in seeds if s.get("artifacts")]
+        assert len(artifact_seeds) == 1
+        seed = artifact_seeds[0]
+        assert len(seed["artifacts"]) == 1
+        blob_hash = seed["artifacts"][0]["blob_hash"]
+        # Read the blob back and verify content
+        blob_bytes = vault.blob_store.read_blob(blob_hash)
+        assert blob_bytes is not None
+        assert blob_bytes == b"print('hello world')"
+
+    def test_scrub_integration_in_artifact_blob(self, tmp_path, fake_env):
+        """A known .env value pasted inside a code fence → blob bytes are
+        redacted before write."""
+        patterns = build_replacement_patterns(discover_secrets_from_env(fake_env))
+        with patch(
+            "plugins.memory.seedvault.extractor.get_scrub_patterns",
+            return_value=patterns,
+        ):
+            vault = SeedVault(tmp_path / "vault")
+            content = "```bash\nexport OPENAI_API_KEY=sk-test-1234567890abcdef\n```"
+            seeds = extract_seeds(
+                messages=[{"role": "user", "content": content}],
+                session_id="test-scrub-artifact",
+                profile="default",
+                blob_store=vault.blob_store,
+            )
+        # Find the artifact seed
+        artifact_seeds = [s for s in seeds if s.get("artifacts")]
+        assert len(artifact_seeds) == 1
+        seed = artifact_seeds[0]
+        blob_hash = seed["artifacts"][0]["blob_hash"]
+        blob_bytes = vault.blob_store.read_blob(blob_hash)
+        assert blob_bytes is not None
+        # The secret should be redacted in the blob
+        assert b"sk-test-1234567890abcdef" not in blob_bytes
+        assert b"[REDACTED:OPENAI_API_KEY]" in blob_bytes
+
+    def test_artifact_seed_core_claim_is_description(self, tmp_path):
+        """Artifact seed core_claim is a description, not the raw content."""
+        vault = SeedVault(tmp_path / "vault")
+        content = "```python\ndef very_long_function_name():\n    pass\n```"
+        seeds = extract_seeds(
+            messages=[{"role": "user", "content": content}],
+            session_id="test-desc-001",
+            profile="default",
+            blob_store=vault.blob_store,
+        )
+        artifact_seeds = [s for s in seeds if s.get("artifacts")]
+        assert len(artifact_seeds) == 1
+        # core_claim should be a short description, not the code itself
+        claim = artifact_seeds[0]["core_claim"]
+        assert "def very_long_function_name" not in claim
+        assert "code" in claim.lower() or "python" in claim.lower()
+
+    def test_one_seed_per_artifact(self, tmp_path):
+        """Two code fences → two artifact seeds, each with one artifact pointer."""
+        vault = SeedVault(tmp_path / "vault")
+        content = (
+            "```python\nprint(1)\n```\n"
+            "```bash\necho hello\n```"
+        )
+        seeds = extract_seeds(
+            messages=[{"role": "user", "content": content}],
+            session_id="test-multi-art-001",
+            profile="default",
+            blob_store=vault.blob_store,
+        )
+        artifact_seeds = [s for s in seeds if s.get("artifacts")]
+        assert len(artifact_seeds) == 2
+        assert len(artifact_seeds[0]["artifacts"]) == 1
+        assert len(artifact_seeds[1]["artifacts"]) == 1
+
+    def test_prose_patterns_dont_match_inside_code_fences(self, tmp_path):
+        """A comment inside a code fence that matches a prose pattern should
+        NOT produce a duplicate prose seed."""
+        vault = SeedVault(tmp_path / "vault")
+        content = (
+            "```bash\n# must stay OFF to prevent crashes\nexport FOO=bar\n```\n"
+            "This is a constraint about the system."
+        )
+        seeds = extract_seeds(
+            messages=[{"role": "user", "content": content}],
+            session_id="test-strip-001",
+            profile="default",
+            blob_store=vault.blob_store,
+        )
+        # We should get: 1 artifact seed (bash block) + 1 prose seed (constraint)
+        # The "# must stay OFF" inside the code fence should NOT match
+        artifact_seeds = [s for s in seeds if s.get("artifacts")]
+        prose_seeds = [s for s in seeds if not s.get("artifacts")]
+        assert len(artifact_seeds) == 1
+        # The prose seed should be about "constraint about the system"
+        # not about "must stay OFF"
+        for ps in prose_seeds:
+            assert "stay OFF" not in ps["core_claim"]
+
+    def test_no_blob_store_means_no_artifact_pointer(self, tmp_path):
+        """Without a blob_store, artifact seeds are created but with empty
+        artifacts arrays."""
+        content = "```python\nprint(1)\n```"
+        seeds = extract_seeds(
+            messages=[{"role": "user", "content": content}],
+            session_id="test-no-blob-001",
+            profile="default",
+            blob_store=None,
+        )
+        artifact_seeds = [s for s in seeds if s.get("artifacts") is not None and len(s.get("artifacts", [])) == 0]
+        # Should still have an artifact seed (just without the blob pointer)
+        assert len(artifact_seeds) >= 1
