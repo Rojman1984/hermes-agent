@@ -19,6 +19,8 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from .scrub import get_scrub_patterns, scrub_text
+
 logger = logging.getLogger(__name__)
 
 
@@ -281,7 +283,33 @@ def extract_seeds(
     
     Returns raw seed dicts — they still need to pass the commit gate
     (validator.py) before landing in the vault.
+    
+    Commit-time scrub: raw message content is scrubbed for secrets
+    (from .env) BEFORE reaching either extraction path.  This ensures
+    secrets never reach the LLM extraction API call or the heuristic
+    pattern matcher.  (Phase 8a)
     """
+    # Phase 8a: commit-time scrub — sanitize raw message content before
+    # extraction so secrets never enter the seed pipeline.
+    scrub_patterns = get_scrub_patterns()
+    if scrub_patterns:
+        scrubbed_messages = []
+        for msg in messages:
+            msg_copy = dict(msg)
+            content = msg_copy.get("content", "")
+            if isinstance(content, str) and content:
+                cleaned, n = scrub_text(content, scrub_patterns)
+                if n > 0:
+                    msg_copy["content"] = cleaned
+                    logger.debug(
+                        "SeedVault: commit-time scrub redacted %d secret(s) "
+                        "in message role=%s",
+                        n,
+                        msg.get("role", "?"),
+                    )
+            scrubbed_messages.append(msg_copy)
+        messages = scrubbed_messages
+
     if llm_caller is not None:
         seeds = _llm_extract(messages, session_id, profile, llm_caller)
         if seeds:

@@ -33,6 +33,7 @@ from .vault import SeedVault
 from .validator import CommitGate
 from .state_digest import StateDigestManager
 from .extractor import extract_seeds
+from .scrub import get_scrub_patterns, scrub_text
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +182,11 @@ class SeedVaultMemoryProvider(MemoryProvider):
 
         Uses keyword/tag matching (v1). Returns formatted seed summaries
         to inject as context before the API call.
+
+        Phase 8a: retrieval-time scrub — the entire output is scrubbed
+        for secrets (from .env) immediately before returning, so a seed
+        committed before this phase (or before a value existed in .env)
+        is caught on every future retrieval, not just once.
         """
         if not self._vault:
             return ""
@@ -216,6 +222,18 @@ class SeedVaultMemoryProvider(MemoryProvider):
         lines.append(f"({len(results)} seeds matched)")
 
         result = "\n".join(lines)
+
+        # Phase 8a: retrieval-time scrub — sanitize before injection.
+        scrub_patterns = get_scrub_patterns()
+        if scrub_patterns:
+            result, n = scrub_text(result, scrub_patterns)
+            if n > 0:
+                logger.debug(
+                    "SeedVault: retrieval-time scrub redacted %d secret(s) "
+                    "in prefetch output",
+                    n,
+                )
+
         self._last_prefetch_result = result
         return result
 
@@ -498,7 +516,7 @@ class SeedVaultMemoryProvider(MemoryProvider):
             query = args.get("query", "")
             top_k = min(args.get("top_k", 5), 20)
             results = self._vault.search(query, top_k=top_k)
-            return json.dumps({
+            output = json.dumps({
                 "results": [
                     {
                         "id": s["id"],
@@ -511,6 +529,17 @@ class SeedVaultMemoryProvider(MemoryProvider):
                 ],
                 "count": len(results),
             }, indent=2)
+            # Phase 8a: retrieval-time scrub on tool output.
+            scrub_patterns = get_scrub_patterns()
+            if scrub_patterns:
+                output, n = scrub_text(output, scrub_patterns)
+                if n > 0:
+                    logger.debug(
+                        "SeedVault: retrieval-time scrub redacted %d secret(s) "
+                        "in seedvault_search output",
+                        n,
+                    )
+            return output
 
         elif tool_name == "seedvault_status":
             if not self._vault:
