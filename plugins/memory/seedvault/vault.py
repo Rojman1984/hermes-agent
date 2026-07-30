@@ -24,6 +24,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .blobstore import BlobStore, DEFAULT_MAX_BLOB_BYTES
+
 logger = logging.getLogger(__name__)
 
 
@@ -72,7 +74,7 @@ def _jaccard(a: set[str], b: set[str]) -> float:
 class SeedVault:
     """On-disk seed vault with file locking and atomic writes."""
 
-    def __init__(self, vault_dir: Path):
+    def __init__(self, vault_dir: Path, max_blob_bytes: int = DEFAULT_MAX_BLOB_BYTES):
         self.vault_dir = Path(vault_dir)
         self.seeds_dir = self.vault_dir / "seeds"
         self.archive_dir = self.vault_dir / "archive"
@@ -80,6 +82,7 @@ class SeedVault:
         self.digest_path = self.vault_dir / "state_digest.json"
         self._lock = threading.Lock()
         self.ensure_dirs()
+        self.blob_store = BlobStore(self.vault_dir, max_blob_bytes=max_blob_bytes)
         self._manifest: Dict[str, Any] = self._load_manifest()
 
     # -- Directory setup ----------------------------------------------------
@@ -87,6 +90,9 @@ class SeedVault:
     def ensure_dirs(self) -> None:
         for d in (self.vault_dir, self.seeds_dir, self.archive_dir):
             d.mkdir(parents=True, exist_ok=True)
+        # blobs/ and its shard subdirs are created by BlobStore.ensure_dirs()
+        blobs_dir = self.vault_dir / "blobs"
+        blobs_dir.mkdir(parents=True, exist_ok=True)
 
     # -- Manifest -----------------------------------------------------------
 

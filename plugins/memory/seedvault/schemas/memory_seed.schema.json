@@ -94,7 +94,7 @@
           },
           "reason": {
             "type": "string",
-            "enum": ["initial", "provenance_verified", "explicit_positive", "drift_detected", "superseded", "age_decay"]
+            "enum": ["initial", "provenance_verified", "explicit_positive", "drift_detected", "superseded", "age_decay", "artifact_stale"]
           },
           "at": {
             "type": "string",
@@ -137,6 +137,36 @@
       "type": ["string", "null"],
       "format": "date-time",
       "description": "Last time Stage 2 validation ran. null if never validated."
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["blob_hash", "content_type"],
+        "properties": {
+          "blob_hash": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "SHA-256 hash of the artifact bytes (content-addressed key in the blob store)"
+          },
+          "content_type": {
+            "type": "string",
+            "enum": ["bash", "code", "diff", "config"],
+            "description": "Detected artifact type"
+          },
+          "language": {
+            "type": ["string", "null"],
+            "description": "Language tag from code fence (e.g. python, yaml). null for bash/diff."
+          },
+          "byte_length": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Size of the artifact in bytes (stored in blob index, duplicated here for quick reference)"
+          }
+        },
+        "additionalProperties": false
+      },
+      "description": "Artifact pointers — verbatim content stored in the blob store, referenced by SHA-256 hash. Optional: seeds without artifacts are unaffected (backward compatible)."
     }
   },
   "additionalProperties": false
